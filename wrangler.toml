@@ -1,0 +1,20 @@
+name = "workers-trpc-websocket-durable-objects"
+main = "api/index.ts"
+compatibility_date = "2022-05-10"
+workers_dev = true
+node_compat = true
+
+[durable_objects]
+bindings = [
+  { name = "DO_COUNTER", class_name = "CounterDurableObject" },
+  { name = "TRPC_POOL", class_name = "TRPCPool" },
+  { name = "TRPC_SOCKETS", class_name = "TRPCSockets" },
+]
+
+[[migrations]]
+tag = "v1" # Should be unique for each entry
+new_classes = ["CounterDurableObject", "TRPCPool", "TRPCSockets"] # Array of new classes
+
+[site]
+bucket = "./ui/dist"
+include = ["*"]
