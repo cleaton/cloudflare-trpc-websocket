@@ -14,6 +14,14 @@ import { object } from 'zod';
   const decrement = () => {
     count = proxy.DO_COUNTER.dec.mutate(q)
   }
+  let q2 = 0;
+  let r = proxy.DO_COUNTER.count.subscribe(namespace, {
+    onData: (v) => {
+      if (v.type == "data") {
+        q2 = v.data
+      }
+    },
+  });
 </script>
 
 <button on:click={increment}>+</button>

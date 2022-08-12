@@ -6,7 +6,7 @@ import {
     createWSClient,
     wsLink
 } from '@trpc/client';
-import type { AppRouter } from '@backend/trpc-server';
+import type { AppRouter } from '@backend/trpc-cloudflare-server';
 const isSSR = false; //toggle RCP mode depending on SSR
 
 
