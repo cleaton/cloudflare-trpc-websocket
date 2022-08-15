@@ -2,75 +2,71 @@ import { applyWSSHandler } from '@trpc/server/adapters/ws';
 import { Environment } from './types';
 import { Group, Replica, Socket, identify } from 'dog';
 import { EventEmitter } from 'events';
-import { initTRPC, TRPCError } from '@trpc/server';
-import { CounterDurableObject, api } from './durable-counter';
+import { ProcedureType, TRPCError } from '@trpc/server';
+import { appRouter, TRPCContext } from './trpc-api';
+import { JSONRPC2, TRPCClientOutgoingMessage, TRPCResponseMessage } from '@trpc/server/rpc';
+import { getCauseFromUnknown, getErrorFromUnknown, parseMessage, transformTRPCResponse } from './helpers';
+import { isObservable, observable } from '@trpc/server/observable';
+import { createNanoEvents } from 'nanoevents';
 
-type TRPCContext = {
-  env: Environment,
-  req: Request,
+
+// Forward request to target Durable Object Executor
+type executorSelectionArgs = {
+  path: string,
+  type: ProcedureType,
+  rawInput: unknown,
+  ctx: TRPCContext,
+  next: any
 }
-
-const DOS = {
-  DO_COUNTER: CounterDurableObject.getStub,
-  TEST: "HIHIH"
+export type executorRequest = {
+  path: string,
+  type: ProcedureType,
+  rawInput: unknown,
+  poolID?: string,
+  name?: string,
 }
+export type StubResponse = {
+  stub: DurableObjectStub,
+  name: string,
+}
+export type ExecutorSelection = (executorSelectionArgs) => StubResponse
+export function withExecutor(executorSelection: ExecutorSelection) {
+  return async (args: executorSelectionArgs) => {
+    let { path, ctx, type, rawInput, next } = args;
+    if (ctx.self && next) return next();
+    const s = executorSelection(args);
 
-const t = initTRPC<{
-  ctx: TRPCContext;
-}>()();
-
-const appRouter = t.router({
-  DO_COUNTER: api
-});
-
-t.procedure
-
-export type AppRouter = typeof appRouter;
-
-export async function doRoute({ path, type, next, ctx, rawInput, meta }) {
-  const parts = path.split(".");
-  const first = parts[0];
-  console.log(`FIRST ${first} ${JSON.stringify(DOS[first])}`)
-  if (first === "DO_COUNTER") {
-    console.log("HERE I AM")
-    const stub = CounterDurableObject.getStub(rawInput, ctx.env);
-    const { pathname } = new URL(ctx.req.url);
-    const base = ctx.req.url.replace(pathname, "")
-    let method = 'GET'
-    let body: string = undefined
-    console.log(type)
-    let params = ""
-    if (type === 'query') {
-      const p = new URLSearchParams({ input: JSON.stringify(rawInput) });
-      params = '?' + p
-    } else if (type === 'mutation') {
-      method = 'POST'
-      body = JSON.stringify(rawInput)
-    } else if (type === 'subscription') {
-      method = 'PATCH'
-      body = JSON.stringify(rawInput)
+    if (s) {
+      const rest = path.slice(path.indexOf('.') + 1);
+      let payload: executorRequest = {
+        path: rest,
+        type,
+        rawInput,
+        poolID: ctx.poolID,
+        name: s.name
+      }
+      const executorRequest = new Request(`http://localhost/trpc`, {
+        method: 'POST',
+        headers: ctx.req.headers,
+        body: JSON.stringify(payload)
+      });
+      let resp = await s.stub.fetch(executorRequest);
+      let t = await resp.text();
+      if (resp.ok) {
+        let d = JSON.parse(t)
+        return { ok: true, data: d?.result?.data };
+      }
+      return { ok: false, error: Error(t) };
     }
-
-    const url = `${base}/${parts.slice(1).join("/")}` + params;
-    console.log(url)
-    const myRequest = new Request(url, {
-      method,
-      headers: ctx.req.headers,
-      body
-    });
-    const resp = await stub.fetch(myRequest);
-    console.log(`RESPPPPP: ${JSON.stringify(resp)}`)
-    let text = await resp.text();
-    let d = JSON.parse(text);
-    console.log(text);
-    return {ok: true, data: d.result.data}
+    throw new TRPCError({ code: 'BAD_REQUEST' });
   }
-  return next();
 }
 
-export async function executeInPool(req: Request, env: Environment) {
+
+// Websocket loablalance & fanout pool using DOG
+
+export async function websocketPool(req: Request, env: Environment) {
   // users in same location share pool to keep durable object close to users
-  console.log(JSON.stringify(req.cf))
   const poolname = `${req.cf?.country}_${req.cf?.city}`
   console.log(`loading pool ${poolname}`)
   const group = env.TRPC_POOL.idFromName(poolname);
@@ -90,7 +86,6 @@ export async function executeInPool(req: Request, env: Environment) {
 
   // Send request to the Replica instance
   const resp = await replica.fetch(req);
-  console.log(`RESP:::: ${JSON.stringify(resp)}`)
   return resp;
 }
 
@@ -105,79 +100,244 @@ export class TRPCPool extends Group<Environment> {
   }
 }
 
-export class SocketWsAdapter extends EventEmitter {
-  constructor(public readonly socket: Socket, public readonly env: Environment) {
-    super();
-  }
-
-  public close(code?: any, reason?: any) {
-    this.socket.close(code, reason)
-  }
-
-  public get readyState(): number {
-    return 1
-  }
-  public send(message: any) {
-    this.socket.send(message)
-  }
-
+export type SendMessage = {
+  topic: string,
+  message: unknown
 }
 
+type Subscription = {
+  socket: Socket,
+  id: JSONRPC2.RequestId
+}
 export class TRPCSockets extends Replica<Environment> {
-  private requests: Map<string, Request> = new Map();
-  private connections: Map<string, SocketWsAdapter> = new Map();
-  private ee: EventEmitter;
   private env: Environment;
   private handler;
+  private transformer;
+  private router;
+  private sockets: Map<string, Socket> = new Map();
+  private sockSubTopics: Map<string, Map<JSONRPC2.RequestId, string>> = new Map();
+  private topicSubscriptions: Map<string, Map<string, JSONRPC2.RequestId>> = new Map();
+  private requests: Map<string, Request> = new Map();
 
   link(env: Environment) {
-    this.ee = new EventEmitter();
     this.env = env;
-    this.handler = applyWSSHandler({ wss: this, router: appRouter, createContext: (ops) => ({ env, req: ops.req }) });
+    this.router = appRouter;
+    this.transformer = appRouter._def.transformer;
+    //this.handler = applyWSSHandler({ wss: this, router: appRouter, createContext: (ops) => ({ env, req: ops.req, poolID: this.uid }) });
     return {
       parent: env.TRPC_POOL, // parent Group
       self: env.TRPC_SOCKETS, // self-identifier
     };
   }
 
-  public get clients(): IterableIterator<SocketWsAdapter> {
-    return this.connections.values()
+  respond(socket: Socket, untransformedJSON: TRPCResponseMessage) {
+    console.log(`SENDING MESSAGE TO ${socket.uid} ${JSON.stringify(untransformedJSON)}`)
+    socket.send(
+      JSON.stringify(transformTRPCResponse(this.router, untransformedJSON)),
+    );
   }
 
-  public on(event, callback) {
-    return this.ee.on(event, callback)
+  private async parseMessage(socket: Socket, message: string) {
+    try {
+      const msgJSON: unknown = JSON.parse(message);
+      const msgs: unknown[] = Array.isArray(msgJSON) ? msgJSON : [msgJSON];
+      const promises = msgs
+        .map((raw) => parseMessage(raw, this.transformer))
+        .map((r) => this.handleRequest(socket, r));
+      await Promise.all(promises);
+    } catch (cause) {
+      const error = new TRPCError({
+        code: 'PARSE_ERROR',
+        cause: getCauseFromUnknown(cause),
+      });
+
+      this.respond(socket, {
+        id: null,
+        error: this.router.getErrorShape({
+          error,
+          type: 'unknown',
+          path: undefined,
+          input: undefined,
+          ctx: undefined,
+        }),
+      });
+    }
+  }
+
+  private unsubscribe(socket: Socket, id: JSONRPC2.RequestId) {
+    const subscriptions = this.sockSubTopics.get(socket.uid);
+    const topic = subscriptions?.get(id)
+    const subscribers = this.topicSubscriptions.get(topic)
+    topic ? subscribers?.delete(socket.uid) : undefined
+    return subscriptions?.delete(id)
+  }
+
+  private async unsubscribeAll(socket: Socket) {
+    const subscriptions = this.sockSubTopics.get(socket.uid);
+    for (let [id, topic] of subscriptions) {
+      const subscribers = this.topicSubscriptions.get(topic)
+      subscribers?.delete(socket.uid)
+      subscriptions.delete(id)
+    }
+  }
+
+  private async handleRequest(socket: Socket, msg: TRPCClientOutgoingMessage) {
+    const { id, jsonrpc } = msg;
+    /* istanbul ignore next */
+    if (id === null) {
+      throw new TRPCError({
+        code: 'BAD_REQUEST',
+        message: '`id` is required',
+      });
+    }
+    if (msg.method === 'subscription.stop') {
+      if (this.unsubscribe(socket, id)) {
+        this.respond(socket, {
+          id,
+          jsonrpc,
+          result: {
+            type: 'stopped',
+          },
+        });
+      }
+      return;
+    }
+    const { path, input } = msg.params;
+    const type = msg.method;
+    const req = this.requests.get(socket.uid);
+    const ctx = { env: this.env, poolID: this.uid, req };
+    try {
+      const caller = this.router.createCaller(ctx);
+      if (type === 'subscription') {
+        if (this.sockSubTopics.get(socket.uid)?.has(id)) {
+          // duplicate request ids for client
+          this.unsubscribe(socket, id)
+          throw new TRPCError({
+            message: `Duplicate id ${id}`,
+            code: 'BAD_REQUEST',
+          });
+        }
+
+        // Redirect the JSONRPC subsciption request
+        const mergedInput = {
+          ...input,
+          ___msg: msg
+        }
+
+
+        const result = await caller[type](path, mergedInput);
+        const ots = this.topicSubscriptions.get(result.topic);
+        const ts = ots || new Map<string, JSONRPC2.RequestId>();
+        ts.set(socket.uid, id);
+        if (!ots) {
+          this.topicSubscriptions.set(result.topic, ts)
+        }
+        let os = this.sockSubTopics.get(socket.uid);
+        let s = this.sockSubTopics.get(socket.uid) || new Map<JSONRPC2.RequestId, string>();
+        s.set(id, result.topic);
+        if (!os) {
+          this.sockSubTopics.set(socket.uid, s);
+        }
+
+        this.respond(socket, {
+          id,
+          jsonrpc,
+          result: {
+            type: 'started',
+          },
+        });
+        this.respond(socket, {
+          id,
+          jsonrpc,
+          result: {
+            type: 'data',
+            data: result.message,
+          },
+        });
+      } else {
+        const result = await caller[type](path, input as any);
+        // send the value as data if the method is not a subscription
+        this.respond(socket, {
+          id,
+          jsonrpc,
+          result: {
+            type: 'data',
+            data: result,
+          },
+        });
+        return;
+      }
+    } catch (cause) /* istanbul ignore next */ {
+      // procedure threw an error
+      const error = getErrorFromUnknown(cause);
+      this.respond(socket, {
+        id,
+        jsonrpc,
+        error: this.router.getErrorShape({
+          error,
+          type,
+          path,
+          input,
+          ctx,
+        }),
+      });
+    }
   }
 
   async onopen(socket: Socket) {
-    const req = this.requests.get(socket.uid);
-    this.requests.delete(socket.uid);
-    const wrap = new SocketWsAdapter(socket, this.env);
-    this.connections.set(socket.uid, wrap)
-    this.ee.emit('connection', wrap, req);
+    this.sockets.set(socket.uid, socket)
   }
   async onclose(socket: Socket) {
-    this.connections.get(socket.uid)?.emit('close')
-    this.connections.delete(socket.uid)
-    console.log("ON CLOSE")
+    this.requests.delete(socket.uid)
+    this.sockets.delete(socket.uid)
+    this.unsubscribeAll(socket)
   }
 
   async onmessage(socket: Socket, data: string) {
-    this.connections.get(socket.uid)?.emit('message', data)
-    console.log("ON MESSAGE")
+    console.log(`MESSAGE ############ ${data}`)
+    this.parseMessage(socket, data)
+  }
+
+  async fetch(req: Request, init?: RequestInit): Promise<Response> {
+    let url = new URL(req.url);
+    switch (url.pathname) {
+      case "/send":
+        const payload = await req.json<SendMessage>();
+        const subs = this.topicSubscriptions.get(payload.topic) || new Map();
+        for (let [socketid, id] of subs) {
+          const socket = this.sockets.get(socketid)
+          this.respond(socket, {
+            id,
+            jsonrpc: "2.0",
+            result: {
+              type: 'data',
+              data: payload.message,
+            },
+          });
+        }
+        if (subs.size) {
+          return new Response(null, { status: 204 })
+        } else {
+          return new Response("No subscribers", { status: 404 })
+        }
+      default:
+        return super.fetch(req, init);
+    }
   }
 
   async receive(req: Request) {
-    try {
-      const id = req.headers.get("x-dog-client-identifier");
-      this.requests.set(id, new Request(req));
-      const resp = await this.connect(req);
-      if (resp.status != 101) {
-        this.requests.delete[id];
-      }
-      return resp
-    } catch (error) {
-      console.log(error)
-      return new Response('err', { status: 500 });
+    let url = new URL(req.url);
+    switch (url.pathname) {
+      case "/trpc":
+        const id = req.headers.get("x-dog-client-identifier");
+        this.requests.set(id, new Request(req.url, { headers: req.headers, method: req.method }));
+        const resp = await this.connect(req);
+        if (resp.status != 101) {
+          this.requests.delete[id];
+        }
+        return resp;
+      default:
+        return new Response("Not found", { status: 404 });
     }
   }
 }

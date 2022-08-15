@@ -1,36 +1,35 @@
 import { Environment } from "./types";
 import { initTRPC, TRPCError } from '@trpc/server';
 import { observable } from '@trpc/server/observable';
-import { fetchRequestHandler } from './do_request_handler'
 import { z } from 'zod';
 import { EventEmitter } from 'events';
-import { doRoute, TRPCDurableObject } from "./trpc-cloudflare-server";
+import { withExecutor } from "./trpc-cloudflare-server";
+import { TRPCContext } from "./trpc-api";
+import { TRPCExecutor } from "./trpc-executor";
 
-type CTX = {
-	self: CounterDurableObject
-}
+
+type SelfContext = TRPCContext & {self: CounterDurableObject}
 
 const t = initTRPC<{
-	ctx: CTX;
+	ctx: SelfContext;
 }>()();
 
-const inputSchema = z.object({ userId: z.string() });
 const Count = z.object({ amount: z.number() });
 const HasNamespace = z.object({ _namespace: z.string() });
 type HasNamespaceT = z.infer<typeof HasNamespace>;
   
 const NsCount = Count.merge(HasNamespace);
+t.middleware(async ({method, next}) => next())
 
-const subscription = t.middleware(async ({type, path, next}) => {
-	if (type === 'subscription') {
-		let r = await next();
-		console.log(`SUBSCRIBE: ${JSON.stringify(r)}`)
-		return r;
+const executor = t.middleware(withExecutor(({ctx, rawInput}) => {
+	const r = HasNamespace.safeParse(rawInput);
+	if (r.success) {
+		const id = ctx.env.DO_COUNTER.idFromName(r.data._namespace);
+		return {stub: ctx.env.DO_COUNTER.get(id), name: r.data._namespace};
 	}
-	return next();
-});
+}));
 
-const doProcedure = t.procedure.use(t.middleware(doRoute)).use(subscription);
+const doProcedure = t.procedure.use(executor);
 
 // tRPC for this object definition
 export const api = t.router({
@@ -48,60 +47,38 @@ export const api = t.router({
 	get: doProcedure.input(HasNamespace).query(({ input, ctx }) => {
 		return ctx.self.get()
 	}),
-	count: doProcedure.input(HasNamespace).subscription(({ input, ctx }) => {
+	count: doProcedure.input(HasNamespace).subscription(async ({ input, ctx }) => {
 		// `resolve()` is triggered for each client when they start subscribing `onAdd`
-	
+		const n = await ctx.self.get();
 		// return an `observable` with a callback which is triggered immediately
 		return observable<number>((emit) => {
-		  const sub = (data: number) => {
-			// emit data to client
-			emit.next(data);
-		  };
-	
-		  // trigger `onAdd()` when `add` is triggered in our event emitter
-		  CounterDurableObject.ee.on('count', sub);
-	
-		  // unsubscribe function when client disconnects or stops subscribing
-		  return () => {
-			CounterDurableObject.ee.off('count', sub);
-		  };
+		  emit.next(['count', n])
+		  emit.complete();
+		  return () => {};
 		});
 	  })
 });
 
 // Durable Object implementation
-export class CounterDurableObject implements TRPCDurableObject {
-	private storage: DurableObjectStorage;
+export class CounterDurableObject extends TRPCExecutor implements DurableObject {
 	private readonly k = "counter";
-	public static router = api;
-	public static ee: EventEmitter = new EventEmitter();
-
 	constructor(
 		private state: DurableObjectState,
-		private env: Environment,
+		public env: Environment,
 	) {
-		this.storage = state.storage;
-	}
-	static getStub(rawInput: unknown, env: Environment): DurableObjectStub {
-		const result = HasNamespace.safeParse(rawInput);
-		if (!result.success) {
-		  throw new TRPCError({ code: 'BAD_REQUEST' });
-		}
-		const d: HasNamespaceT = result.data
-		const id = env.DO_COUNTER.idFromName(d._namespace);
-		return env.DO_COUNTER.get(id);
+		super("counterType", state.id.toString(), env, api, state.storage);
 	}
 
 	public async inc(amount: number): Promise<number> {
 		const val = await this.get() + amount;
 		await this.storage.put(this.k, val);
-		CounterDurableObject.ee.emit('count', val)
+		this.emit('count', val)
 		return val;
 	}
 	public async dec(amount: number): Promise<number> {
 		const val = await this.get() - amount;
 		await this.storage.put(this.k, val);
-		CounterDurableObject.ee.emit('count', val)
+		this.emit('count', val)
 		return val;
 	}
 
@@ -110,13 +87,7 @@ export class CounterDurableObject implements TRPCDurableObject {
 	}
 
 	public async fetch(request: Request) {
-		console.log(`DO: ${JSON.stringify(request)}`)
-		return fetchRequestHandler({
-			endpoint: '',
-			req: request,
-			router: api,
-			createContext: () => ({ self: this }),
-		});
+		return await this.handle(request);
 	}
 
 }

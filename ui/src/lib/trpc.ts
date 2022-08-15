@@ -6,7 +6,7 @@ import {
     createWSClient,
     wsLink
 } from '@trpc/client';
-import type { AppRouter } from '@backend/trpc-cloudflare-server';
+import type { AppRouter } from '@backend/trpc-api';
 const isSSR = false; //toggle RCP mode depending on SSR
 
 
@@ -29,3 +29,5 @@ const client = createTRPCClient<AppRouter>({
 });
 
 export const proxy = createTRPCClientProxy(client);
+
+export type proxyType = typeof proxy;

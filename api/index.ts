@@ -1,7 +1,7 @@
 import { getAssetFromKV } from '@cloudflare/kv-asset-handler';
 //@ts-ignore
 import manifestJSON from '__STATIC_CONTENT_MANIFEST'
-import { executeInPool } from './trpc-cloudflare-server';
+import { websocketPool } from './trpc-cloudflare-server';
 import { Environment } from './types';
 const assetManifest = JSON.parse(manifestJSON)
 
@@ -16,7 +16,7 @@ const worker: ExportedHandler<Environment> = {
 		// TRPC API HANDLER
 		if (pathname === '/trpc') {
 			if (req.method === "GET" && req.headers.get("upgrade") === "websocket") {
-				return executeInPool(req, env)
+				return websocketPool(req, env)
 			}
 
 		}
