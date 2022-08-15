@@ -16,14 +16,18 @@ import { text } from "svelte/internal";
   const decrement = () => {
     client.DO_COUNTER.dec.mutate(q);
   };
-  $: q2 = proxy.DO_COUNTER.count.subscribe(namespace, {
+  let subscription;
+  $: q2 = ((n) => {
+    subscription?.unsubscribe()
+    subscription = proxy.DO_COUNTER.count.subscribe(n, {
     onComplete: () => {
       console.log("COMPLETED")
     },
     onData: (v) => {
       count = v;
     },
-  });
+  })
+  })(namespace);
 </script>
 
 <p>Your namespace :: {_namespace}</p> 
