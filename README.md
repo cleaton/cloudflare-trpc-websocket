@@ -15,14 +15,15 @@ TRPC executor stores replica subscritpion durable state, in case of DO restart (
 
 ## Flow
 
-Connect:
+### Connect:
 Client -http-> (Group <[country, city]>) -http-> (Replica <1...n>) change protocol 101
+
 Client -ws-> (Replica n)
 
-subscribe
+### subscribe
 Client -ws-> (Replica n) -fetch-> (Target DO)
 
-on event
+### on event
 Client <-ws- (Replica n) <-fetch- (Target DO)
 
 usage:
